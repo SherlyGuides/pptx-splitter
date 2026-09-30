@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Converting — PPTX Splitter</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<main class="wrap">
+  <header style="margin-bottom: 0">
+    <h1 id="heading">Converting…</h1>
+    <p class="status" id="status">Started {{ job.started }}</p>
+  </header>
+  <div class="bar" id="bar"><span id="progress"></span></div>
+
+  <div id="summary"></div>
+  <div id="decks"></div>
+
+  <a class="back" href="/">← Convert more decks</a>
+</main>
+
+<script>
+const JOB_ID = {{ job.id | tojson }};
+
+function esc(value) {
+  return String(value).replace(/[&<>"']/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function kindOf(name) {
+  return /\.pdf$/i.test(name) ? 'pdf' : 'video';
+}
+
+function render(job) {
+  const done = job.status === 'done';
+  const pct = done ? 100 : (job.total ? Math.round(((job.current - 1) / job.total) * 100) : 0);
+  document.getElementById('progress').style.width = Math.max(pct, 4) + '%';
+  document.getElementById('bar').classList.toggle('done', done);
+
+  document.title = (done ? 'Finished' : 'Converting…') + ' — PPTX Splitter';
+  document.getElementById('heading').textContent = done ? 'Finished' : 'Converting…';
+  document.getElementById('status').innerHTML = done
+    ? `Saved to <code>${esc(job.outroot)}</code>`
+    : `<span class="spin"></span>Deck ${job.current} of ${job.total} · large decks can take a few minutes`;
+
+  const ok = job.results.filter(r => r.ok).length;
+  const failed = job.results.length - ok;
+  const fileCount = job.results.reduce((n, r) => n + r.files.length, 0);
+
+  let summary = '';
+  if (done) {
+    summary = `<div class="card summary">
+        <div>
+          <div class="big">${ok} of ${job.total} deck${job.total === 1 ? '' : 's'} converted</div>
+          <div class="small">${fileCount} file${fileCount === 1 ? '' : 's'} written${failed ? ` · ${failed} failed` : ''}</div>
+        </div>
+        ${fileCount ? `<a class="btn ok" href="/download-all/${JOB_ID}">Download all (.zip)</a>` : ''}
+      </div>`;
+  }
+  if (job.error) summary += `<div class="notice err">${esc(job.error)}</div>`;
+  document.getElementById('summary').innerHTML = summary;
+
+  document.getElementById('decks').innerHTML = job.results.map(r => {
+    const meta = r.error && !r.slides
+      ? 'Could not be read'
+      : r.videos
+        ? `${r.slides} slides · ${r.videos} video${r.videos === 1 ? '' : 's'} · split into ${r.pieces.length} pieces`
+        : `${r.slides} slides · no video · single PDF`;
+
+    const files = r.files.map(f => `
+      <li><span class="tag ${kindOf(f.name)}">${kindOf(f.name)}</span>
+          <a class="name" href="/download/${JOB_ID}?path=${encodeURIComponent(f.path)}" title="${esc(f.name)}">${esc(f.name)}</a>
+          <span class="size">${esc(f.size)}</span></li>`).join('');
+    const pieces = r.pieces.map(p => `
+      <li><span class="tag ${p.kind}">${p.kind}</span>
+          <span class="name">${esc(p.name)}</span>
+          <span class="size">${p.kind === 'video' ? 'slide ' + p.slide : p.pages + ' page' + (p.pages === 1 ? '' : 's')}</span></li>`).join('');
+
+    return `<div class="card">
+        <div class="deck-head">
+          <h2>${esc(r.deck)}</h2>
+          <span class="tag ${r.ok ? 'ok' : 'fail'}">${r.ok ? 'done' : 'failed'}</span>
+        </div>
+        <div class="meta">${esc(meta)}</div>
+        ${r.error ? `<div class="notice err" style="margin:0">${esc(r.error)}</div>`
+                  : `<ul class="files">${files || pieces}</ul>`}
+      </div>`;
+  }).join('');
+
+  return done;
+}
+
+async function poll() {
+  try {
+    const res = await fetch(`/api/job/${JOB_ID}`);
+    if (res.ok && render(await res.json())) return;
+  } catch (e) { /* transient; retry */ }
+  setTimeout(poll, 1000);
+}
+
+render({{ job | tojson }});
+poll();
+</script>
+</body>
+</html>

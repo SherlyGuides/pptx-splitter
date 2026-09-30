@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PPTX Splitter</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<main class="wrap">
+  <header>
+    <div class="brand">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="14" rx="2"/><path d="M8 21h8M12 18v3"/></svg>
+      PPTX Splitter
+    </div>
+    <h1>Turn PowerPoint decks into PDFs</h1>
+    <p class="lede">Decks without video become a single PDF. Decks with video are split at the video slides into PDFs and separate video files.</p>
+  </header>
+
+  {% if error %}<div class="notice err">{{ error }}</div>{% endif %}
+
+  <form method="post" action="/convert" enctype="multipart/form-data" id="form">
+    <div class="card">
+      <label class="drop" id="drop">
+        <input type="file" name="decks" id="decks" multiple accept=".pptx,.ppt">
+        <div class="drop-icon">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4M6 10l6-6 6 6"/><path d="M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></svg>
+        </div>
+        <strong>Drop decks here or click to browse</strong>
+        <span>.pptx files, as many as you like</span>
+      </label>
+      <ul class="chosen" id="chosen"></ul>
+
+      <details>
+        <summary>Local paths &amp; output folder</summary>
+
+        <div class="field">
+          <label class="title" for="paths">Decks already on this computer</label>
+          <p class="hint">One file or folder path per line. Faster for large decks — nothing is uploaded.</p>
+          <textarea name="paths" id="paths" placeholder="~/Downloads/My Deck.pptx&#10;~/Downloads/All Decks"></textarea>
+          <label class="check"><input type="checkbox" name="recursive" value="1"> Include sub-folders</label>
+        </div>
+
+        <div class="field">
+          <label class="title" for="outdir">Save results to</label>
+          <p class="hint">Each deck gets its own folder here.</p>
+          <input type="text" name="outdir" id="outdir" value="{{ default_output }}">
+        </div>
+      </details>
+    </div>
+
+    <button type="submit" class="btn block" id="go">Convert</button>
+  </form>
+
+  <section class="notes">
+    <h2>Good to know</h2>
+    <ul>
+      <li>Files are named <code>Content piece N - Title</code> in reading order, ready to upload.</li>
+      <li>Teacher notes are kept and renumbered to each PDF's own pages.</li>
+      <li>Decks with hidden slides are refused — hidden slides would shift every later page.</li>
+      <li>Uses Microsoft PowerPoint when installed, otherwise LibreOffice.</li>
+    </ul>
+  </section>
+</main>
+
+<script>
+const input = document.getElementById('decks');
+const drop = document.getElementById('drop');
+const chosen = document.getElementById('chosen');
+
+function fmt(bytes) {
+  const mb = bytes / 1048576;
+  return mb >= 0.1 ? mb.toFixed(1) + ' MB' : Math.round(bytes / 1024) + ' KB';
+}
+
+function list() {
+  chosen.replaceChildren(...[...input.files].map(f => {
+    const li = document.createElement('li');
+    const name = document.createElement('span');
+    name.className = 'name';
+    name.textContent = f.name;
+    const size = document.createElement('span');
+    size.className = 'size';
+    size.textContent = fmt(f.size);
+    li.append(name, size);
+    return li;
+  }));
+}
+
+input.addEventListener('change', list);
+['dragenter', 'dragover'].forEach(e => drop.addEventListener(e, () => drop.classList.add('over')));
+['dragleave', 'drop'].forEach(e => drop.addEventListener(e, () => drop.classList.remove('over')));
+
+document.getElementById('form').addEventListener('submit', () => {
+  const go = document.getElementById('go');
+  go.disabled = true;
+  go.textContent = input.files.length ? 'Uploading…' : 'Starting…';
+});
+</script>
+</body>
+</html>
