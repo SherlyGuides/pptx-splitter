@@ -17,11 +17,13 @@
   <div id="summary"></div>
   <div id="decks"></div>
 
-  <a class="back" href="/">← Convert more decks</a>
+  <a class="back" href="{{ url_for('index') }}">← Convert more decks</a>
 </main>
 
 <script>
 const JOB_ID = {{ job.id | tojson }};
+// Empty locally; "/splitter" when served under a path on a shared site.
+const BASE = {{ request.script_root | tojson }};
 
 function esc(value) {
   return String(value).replace(/[&<>"']/g, c =>
@@ -61,7 +63,7 @@ function render(job) {
           <div class="big">${ok} of ${job.total} deck${job.total === 1 ? '' : 's'} converted</div>
           <div class="small">${fileCount} file${fileCount === 1 ? '' : 's'} written${failed ? ` · ${failed} failed` : ''}</div>
         </div>
-        ${fileCount ? `<a class="btn ok" href="/download-all/${JOB_ID}">Download all (.zip)</a>` : ''}
+        ${fileCount ? `<a class="btn ok" href="${BASE}/download-all/${JOB_ID}">Download all (.zip)</a>` : ''}
       </div>`;
   }
   if (job.error) summary += `<div class="notice err">${esc(job.error)}</div>`;
@@ -76,7 +78,7 @@ function render(job) {
 
     const files = r.files.map(f => `
       <li><span class="tag ${kindOf(f.name)}">${kindOf(f.name)}</span>
-          <a class="name" href="/download/${JOB_ID}?path=${encodeURIComponent(f.path)}" title="${esc(f.name)}">${esc(f.name)}</a>
+          <a class="name" href="${BASE}/download/${JOB_ID}?path=${encodeURIComponent(f.path)}" title="${esc(f.name)}">${esc(f.name)}</a>
           <span class="size">${esc(f.size)}</span></li>`).join('');
     const pieces = r.pieces.map(p => `
       <li><span class="tag ${p.kind}">${p.kind}</span>
@@ -99,7 +101,7 @@ function render(job) {
 
 async function poll() {
   try {
-    const res = await fetch(`/api/job/${JOB_ID}`);
+    const res = await fetch(`${BASE}/api/job/${JOB_ID}`);
     if (res.ok && render(await res.json())) return;
   } catch (e) { /* transient; retry */ }
   setTimeout(poll, 1000);

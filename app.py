@@ -21,6 +21,10 @@ on a server other people reach over the internet. Pasted paths and the output
 folder are switched off there, since both would hand visitors the server's own
 filesystem; every page sits behind the APP_PASSWORD shared password; results
 live in a private folder per job and are deleted after JOB_TTL_HOURS.
+
+Behind a site that already asks for a password (nginx basic auth), set
+TRUST_PROXY_AUTH=1 instead of APP_PASSWORD, and have the proxy send
+X-Forwarded-Prefix when the app is mounted under a path such as /splitter.
 """
 
 from __future__ import annotations
@@ -40,17 +44,29 @@ from flask import (
     Flask, Response, abort, jsonify, redirect, render_template, request, send_file, url_for,
 )
 
+from werkzeug.middleware.proxy_fix import ProxyFix
+
 import split_pptx
 
 HOSTED = os.environ.get("PPTX_SPLITTER_HOSTED", "").strip().lower() in ("1", "true", "yes")
 PASSWORD = os.environ.get("APP_PASSWORD", "")
+# The proxy in front already asks for a password; asking again would clash,
+# since both use the same Authorization header.
+TRUST_PROXY_AUTH = os.environ.get("TRUST_PROXY_AUTH", "").strip().lower() in ("1", "true", "yes")
 JOB_TTL_SECONDS = float(os.environ.get("JOB_TTL_HOURS", "6")) * 3600
 
-if HOSTED and not PASSWORD:
+if HOSTED and not PASSWORD and not TRUST_PROXY_AUTH:
     # An open converter on the internet is free compute for anyone who finds it.
-    raise SystemExit("Hosted mode needs a password: set the APP_PASSWORD environment variable.")
+    raise SystemExit(
+        "Hosted mode needs a password: set APP_PASSWORD, or TRUST_PROXY_AUTH=1 "
+        "when a proxy in front already asks for one."
+    )
 
 app = Flask(__name__)
+if HOSTED:
+    # Behind a proxy: honour its scheme, host and path prefix (/splitter) so
+    # generated links point where the visitor actually is.
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 # Decks are routinely over 100 MB; the default 16 MB cap would reject them.
 app.config["MAX_CONTENT_LENGTH"] = int(os.environ.get("MAX_UPLOAD_MB", "4096")) * 1024 * 1024
 
@@ -63,6 +79,8 @@ DEFAULT_OUTPUT = (
 # A server has no business converting several 250 MB decks at once: LibreOffice
 # is memory-hungry, and parallel runs would only make every job slower. Jobs
 # beyond this wait their turn.
+UPLOAD_ROOT = os.path.join(tempfile.gettempdir(), "pptx-splitter-uploads")
+
 CONVERSIONS = threading.Semaphore(int(os.environ.get("MAX_PARALLEL_JOBS", "1")))
 
 
@@ -151,11 +169,20 @@ def expire_old_jobs() -> None:
             os.remove(bundle_path(job.id))
         except OSError:
             pass
+    # Uploads that were started but never handed to a job.
+    if os.path.isdir(UPLOAD_ROOT):
+        for name in os.listdir(UPLOAD_ROOT):
+            path = os.path.join(UPLOAD_ROOT, name)
+            try:
+                if os.path.getmtime(path) < cutoff:
+                    shutil.rmtree(path, ignore_errors=True)
+            except OSError:
+                pass
 
 
 @app.before_request
 def require_password():
-    if not PASSWORD or request.endpoint in ("healthz", "static"):
+    if TRUST_PROXY_AUTH or not PASSWORD or request.endpoint in ("healthz", "static"):
         return None
     auth = request.authorization
     supplied = (auth.password or "") if auth else ""
@@ -165,6 +192,42 @@ def require_password():
         "Password required.", 401,
         {"WWW-Authenticate": 'Basic realm="PPTX Splitter", charset="UTF-8"'},
     )
+
+
+def upload_dir_for(upload_id: str) -> str:
+    # The id is ours (hex from uuid4); anything else is someone poking at paths.
+    if not upload_id.isalnum() or len(upload_id) != 32:
+        abort(404)
+    path = os.path.join(UPLOAD_ROOT, upload_id)
+    if not os.path.isdir(path):
+        abort(404)
+    return path
+
+
+@app.post("/api/upload/start")
+def upload_start():
+    upload_id = uuid.uuid4().hex
+    os.makedirs(os.path.join(UPLOAD_ROOT, upload_id))
+    return jsonify(upload_id=upload_id)
+
+
+@app.post("/api/upload/<upload_id>")
+def upload_chunk(upload_id: str):
+    """Append one chunk of one deck. Chunks arrive in order; the offset is
+    checked so a retried or out-of-order chunk can never corrupt a deck."""
+    folder = upload_dir_for(upload_id)
+    name = os.path.basename(request.form.get("name") or "")
+    chunk = request.files.get("chunk")
+    if not name.lower().endswith((".pptx", ".ppt")) or name.startswith("~$") or not chunk:
+        return "Only .pptx and .ppt files can be uploaded.", 400
+    target = os.path.join(folder, name)
+    offset = int(request.form.get("offset") or 0)
+    current = os.path.getsize(target) if os.path.exists(target) else 0
+    if offset != current:
+        return f"Chunk out of order (expected offset {current}, got {offset}).", 409
+    with open(target, "ab") as handle:
+        shutil.copyfileobj(chunk.stream, handle)
+    return jsonify(received=os.path.getsize(target))
 
 
 @app.get("/healthz")
@@ -200,8 +263,17 @@ def convert():
             recursive=bool(request.form.get("recursive")),
         ))
 
+    # Decks already sent in chunks by the page's script.
+    upload_id = (request.form.get("upload_id") or "").strip()
+    if upload_id:
+        upload_dir = upload_dir_for(upload_id)
+        decks.extend(
+            os.path.join(upload_dir, name) for name in sorted(os.listdir(upload_dir))
+        )
+
+    # A plain form post (no script) still carries the files themselves.
     uploads = [f for f in request.files.getlist("decks") if f and f.filename]
-    if uploads:
+    if uploads and not upload_dir:
         upload_dir = tempfile.mkdtemp(prefix="pptx-upload-")
         for item in uploads:
             name = os.path.basename(item.filename)

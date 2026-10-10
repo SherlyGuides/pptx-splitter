@@ -1,0 +1,32 @@
+# systemd unit for the PPTX Splitter on a shared server.
+# Runs apart from PM2 (thinkpro, learno-*), as its own unprivileged user, and
+# yields to them: capped memory, low CPU and disk priority.
+[Unit]
+Description=PPTX Splitter (served at /splitter)
+After=network.target
+
+[Service]
+User=pptx-splitter
+Group=pptx-splitter
+WorkingDirectory=/opt/pptx-splitter
+Environment=PPTX_SPLITTER_HOSTED=1
+# nginx already asks for the admin password in front of /splitter.
+Environment=TRUST_PROXY_AUTH=1
+Environment=JOB_TTL_HOURS=6
+Environment=MAX_PARALLEL_JOBS=1
+Environment=HOME=/var/lib/pptx-splitter
+Environment=TMPDIR=/var/lib/pptx-splitter/tmp
+ExecStart=/opt/pptx-splitter/.venv/bin/gunicorn --workers 1 --threads 8 --timeout 0 --bind 127.0.0.1:5055 app:app
+Restart=on-failure
+RestartSec=5
+
+MemoryMax=2G
+Nice=10
+CPUWeight=30
+IOWeight=30
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

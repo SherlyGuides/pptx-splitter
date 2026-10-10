@@ -19,7 +19,7 @@
 
   {% if error %}<div class="notice err">{{ error }}</div>{% endif %}
 
-  <form method="post" action="/convert" enctype="multipart/form-data" id="form">
+  <form method="post" action="{{ url_for('convert') }}" enctype="multipart/form-data" id="form">
     <div class="card">
       <label class="drop" id="drop">
         <input type="file" name="decks" id="decks" multiple accept=".pptx,.ppt">
@@ -97,10 +97,52 @@ input.addEventListener('change', list);
 ['dragenter', 'dragover'].forEach(e => drop.addEventListener(e, () => drop.classList.add('over')));
 ['dragleave', 'drop'].forEach(e => drop.addEventListener(e, () => drop.classList.remove('over')));
 
-document.getElementById('form').addEventListener('submit', () => {
-  const go = document.getElementById('go');
+// Uploads go up in chunks: a proxy in front of the server (Cloudflare caps a
+// request at 100 MB) would reject a large deck sent in one piece.
+const CHUNK = 32 * 1024 * 1024;
+const BASE = {{ request.script_root | tojson }};
+const form = document.getElementById('form');
+const go = document.getElementById('go');
+
+async function post(url, body) {
+  const res = await fetch(BASE + url, { method: 'POST', body });
+  if (!res.ok) throw new Error((await res.text()) || res.statusText);
+  return res.json();
+}
+
+form.addEventListener('submit', async event => {
   go.disabled = true;
-  go.textContent = input.files.length ? 'Uploading…' : 'Starting…';
+  const files = [...input.files];
+  if (!files.length) { go.textContent = 'Starting…'; return; }   // paths only: plain submit
+  event.preventDefault();
+  try {
+    const total = files.reduce((n, f) => n + f.size, 0) || 1;
+    let sent = 0;
+    const { upload_id } = await post('/api/upload/start', new FormData());
+    for (const file of files) {
+      for (let offset = 0; offset < file.size || offset === 0; offset += CHUNK) {
+        const part = new FormData();
+        part.append('name', file.name);
+        part.append('offset', offset);
+        part.append('chunk', file.slice(offset, offset + CHUNK), file.name);
+        await post(`/api/upload/${upload_id}`, part);
+        sent += Math.min(CHUNK, file.size - offset);
+        go.textContent = `Uploading… ${Math.round((sent / total) * 100)}%`;
+        if (!file.size) break;
+      }
+    }
+    // Hand the uploaded decks (and any typed paths) to the normal form post.
+    const hidden = document.createElement('input');
+    hidden.type = 'hidden'; hidden.name = 'upload_id'; hidden.value = upload_id;
+    form.append(hidden);
+    input.value = '';
+    go.textContent = 'Starting…';
+    form.submit();
+  } catch (err) {
+    go.disabled = false;
+    go.textContent = 'Convert';
+    alert('Upload failed: ' + err.message);
+  }
 });
 </script>
 </body>

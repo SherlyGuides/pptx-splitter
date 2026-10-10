@@ -83,11 +83,22 @@ Each `git push` to `main` redeploys automatically.
 
 **New → Web Service**, pick the repository, and choose the Docker runtime. Add `APP_PASSWORD` as an environment variable. Choose a plan with at least **2 GB of memory**: LibreOffice runs out of memory on large decks with 512 MB.
 
-### Settings
+### Or on the ThinkPro server, at glbadmin.thinkpro.academy/splitter
+
+This runs behind the admin site's existing password, so no second password is needed. Everything is in `deploy/`:
+
+1. On the server, as root: `curl -fsSL https://raw.githubusercontent.com/SherlyGuides/pptx-splitter/main/deploy/install.sh | bash`. This installs LibreOffice, ffmpeg and fonts, plus a `pptx-splitter` service on `127.0.0.1:5055`. The service is capped at 2 GB of memory and runs at low priority. It doesn't touch PM2, `thinkpro` or nginx.
+2. Paste `deploy/nginx-splitter.conf` into the `glbadmin` server block. Then run `nginx -t && systemctl reload nginx`.
+3. To update later, run the same install command again.
+
+Uploads go up in 32 MB chunks, because Cloudflare rejects any single request over 100 MB.
+
+
 
 | Variable | Default | What it does |
 |---|---|---|
 | `APP_PASSWORD` | *(required)* | Shared password for the whole site |
+| `TRUST_PROXY_AUTH` | off | Set to `1` instead of a password when nginx in front already asks for one |
 | `JOB_TTL_HOURS` | `6` | How long results stay downloadable |
 | `MAX_UPLOAD_MB` | `4096` | Largest upload accepted |
 | `MAX_PARALLEL_JOBS` | `1` | Conversions running at the same time |
@@ -113,4 +124,5 @@ python3 split_pptx.py                     # prompts; drag files or a folder in
 | `templates/`, `static/` | Web page HTML and CSS |
 | `requirements.txt` | Python libraries to install |
 | `Dockerfile` | Hosted version (LibreOffice + ffmpeg) for putting it online |
+| `deploy/` | Install script, systemd service and nginx block for the ThinkPro server |
 | `output/` | Created on first run; converted files land here by default |
