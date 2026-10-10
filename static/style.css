@@ -158,6 +158,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .
 .tag { flex: none; font-size: 10.5px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; padding: 2px 7px; border-radius: 6px; }
 .tag.pdf { background: var(--accent-soft); color: var(--accent); }
 .tag.video { background: var(--video-soft); color: var(--video); }
+.tag.notes { background: var(--ok-soft); color: var(--ok); }
 .tag.ok { background: var(--ok-soft); color: var(--ok); }
 .tag.fail { background: var(--err-soft); color: var(--err); }
 

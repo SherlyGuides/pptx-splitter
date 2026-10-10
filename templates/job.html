@@ -29,7 +29,9 @@ function esc(value) {
 }
 
 function kindOf(name) {
-  return /\.pdf$/i.test(name) ? 'pdf' : 'video';
+  if (/\.pdf$/i.test(name)) return 'pdf';
+  if (/\.json$/i.test(name)) return 'notes';
+  return 'video';
 }
 
 function render(job) {
@@ -41,8 +43,12 @@ function render(job) {
   document.title = (done ? 'Finished' : 'Converting…') + ' — PPTX Splitter';
   document.getElementById('heading').textContent = done ? 'Finished' : 'Converting…';
   document.getElementById('status').innerHTML = done
-    ? `Saved to <code>${esc(job.outroot)}</code>`
-    : `<span class="spin"></span>Deck ${job.current} of ${job.total} · large decks can take a few minutes`;
+    ? (job.outroot
+        ? `Saved to <code>${esc(job.outroot)}</code>`
+        : `Download your files now — they are deleted from the server after ${job.ttl_hours} hours`)
+    : job.status === 'queued'
+      ? `<span class="spin"></span>Waiting for another conversion to finish…`
+      : `<span class="spin"></span>Deck ${job.current} of ${job.total} · large decks can take a few minutes`;
 
   const ok = job.results.filter(r => r.ok).length;
   const failed = job.results.length - ok;

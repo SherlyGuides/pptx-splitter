@@ -15,28 +15,55 @@ a deck should turn into.
 Two ways to hand over decks, because a 250 MB deck is slow to push through a
 browser: pick files to upload, or paste the path of a file or folder already on
 this machine, which is read in place.
+
+Hosted mode (PPTX_SPLITTER_HOSTED=1, set by the Dockerfile) is for running it
+on a server other people reach over the internet. Pasted paths and the output
+folder are switched off there, since both would hand visitors the server's own
+filesystem; every page sits behind the APP_PASSWORD shared password; results
+live in a private folder per job and are deleted after JOB_TTL_HOURS.
 """
 
 from __future__ import annotations
 
+import hmac
 import os
 import shutil
 import tempfile
 import threading
+import time
 import uuid
 import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from flask import Flask, abort, jsonify, redirect, render_template, request, send_file, url_for
+from flask import (
+    Flask, Response, abort, jsonify, redirect, render_template, request, send_file, url_for,
+)
 
 import split_pptx
 
+HOSTED = os.environ.get("PPTX_SPLITTER_HOSTED", "").strip().lower() in ("1", "true", "yes")
+PASSWORD = os.environ.get("APP_PASSWORD", "")
+JOB_TTL_SECONDS = float(os.environ.get("JOB_TTL_HOURS", "6")) * 3600
+
+if HOSTED and not PASSWORD:
+    # An open converter on the internet is free compute for anyone who finds it.
+    raise SystemExit("Hosted mode needs a password: set the APP_PASSWORD environment variable.")
+
 app = Flask(__name__)
 # Decks are routinely over 100 MB; the default 16 MB cap would reject them.
-app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = int(os.environ.get("MAX_UPLOAD_MB", "4096")) * 1024 * 1024
 
-DEFAULT_OUTPUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
+DEFAULT_OUTPUT = (
+    os.path.join(tempfile.gettempdir(), "pptx-splitter-jobs")
+    if HOSTED
+    else os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
+)
+
+# A server has no business converting several 250 MB decks at once: LibreOffice
+# is memory-hungry, and parallel runs would only make every job slower. Jobs
+# beyond this wait their turn.
+CONVERSIONS = threading.Semaphore(int(os.environ.get("MAX_PARALLEL_JOBS", "1")))
 
 
 @dataclass
@@ -50,6 +77,7 @@ class Job:
     results: list[dict] = field(default_factory=list)
     error: str | None = None
     started: str = field(default_factory=lambda: datetime.now().strftime("%H:%M:%S"))
+    created: float = field(default_factory=time.time)
 
     def as_dict(self) -> dict:
         return {
@@ -57,7 +85,9 @@ class Job:
             "status": self.status,
             "current": self.current,
             "total": len(self.decks),
-            "outroot": self.outroot,
+            # A server's internal folder means nothing to a visitor.
+            "outroot": None if HOSTED else self.outroot,
+            "ttl_hours": round(JOB_TTL_SECONDS / 3600) if HOSTED else None,
             "error": self.error,
             "started": self.started,
             "results": [
@@ -86,11 +116,12 @@ def file_size(path: str) -> str:
 
 
 def run_job(job: Job) -> None:
-    job.status = "running"
     try:
-        for index, deck in enumerate(job.decks, start=1):
-            job.current = index
-            job.results.append(split_pptx.convert_deck(deck, job.outroot))
+        with CONVERSIONS:
+            job.status = "running"
+            for index, deck in enumerate(job.decks, start=1):
+                job.current = index
+                job.results.append(split_pptx.convert_deck(deck, job.outroot))
     except Exception as exc:  # a crash here must not leave the page spinning forever
         job.error = f"{type(exc).__name__}: {exc}"
     finally:
@@ -101,21 +132,68 @@ def run_job(job: Job) -> None:
             shutil.rmtree(job.upload_dir, ignore_errors=True)
 
 
+def bundle_path(job_id: str) -> str:
+    return os.path.join(tempfile.gettempdir(), f"pptx-splitter-{job_id}.zip")
+
+
+def expire_old_jobs() -> None:
+    """Hosted only: a server's disk would otherwise fill with everyone's decks."""
+    if not HOSTED:
+        return
+    cutoff = time.time() - JOB_TTL_SECONDS
+    with LOCK:
+        stale = [j for j in JOBS.values() if j.status == "done" and j.created < cutoff]
+        for job in stale:
+            del JOBS[job.id]
+    for job in stale:
+        shutil.rmtree(job.outroot, ignore_errors=True)
+        try:
+            os.remove(bundle_path(job.id))
+        except OSError:
+            pass
+
+
+@app.before_request
+def require_password():
+    if not PASSWORD or request.endpoint in ("healthz", "static"):
+        return None
+    auth = request.authorization
+    supplied = (auth.password or "") if auth else ""
+    if hmac.compare_digest(supplied.encode(), PASSWORD.encode()):
+        return None
+    return Response(
+        "Password required.", 401,
+        {"WWW-Authenticate": 'Basic realm="PPTX Splitter", charset="UTF-8"'},
+    )
+
+
+@app.get("/healthz")
+def healthz():
+    return "ok"
+
+
 @app.get("/")
 def index():
-    return render_template("index.html", default_output=DEFAULT_OUTPUT)
+    return render_template("index.html", default_output=DEFAULT_OUTPUT, hosted=HOSTED)
 
 
 @app.post("/convert")
 def convert():
-    outroot = (request.form.get("outdir") or "").strip() or DEFAULT_OUTPUT
-    outroot = split_pptx.unquote_path(outroot)
+    expire_old_jobs()
+    job_id = uuid.uuid4().hex[:12]
+    if HOSTED:
+        # Each job gets a folder of its own; the visitor never chooses one.
+        outroot = os.path.join(DEFAULT_OUTPUT, job_id)
+    else:
+        outroot = (request.form.get("outdir") or "").strip() or DEFAULT_OUTPUT
+        outroot = split_pptx.unquote_path(outroot)
 
     decks: list[str] = []
     upload_dir: str | None = None
 
-    # Paths already on this machine are read in place — no copying.
-    typed = (request.form.get("paths") or "").strip()
+    # Paths already on this machine are read in place — no copying. Never on a
+    # server: they would let a visitor convert, and download, any file on it.
+    typed = "" if HOSTED else (request.form.get("paths") or "").strip()
     if typed:
         decks.extend(split_pptx.collect_decks(
             [line for line in typed.splitlines() if line.strip()],
@@ -137,10 +215,15 @@ def convert():
         return render_template(
             "index.html",
             default_output=DEFAULT_OUTPUT,
-            error="No PowerPoint files found. Choose files, or paste a path to a deck or folder.",
+            hosted=HOSTED,
+            error=(
+                "No PowerPoint files found. Choose one or more .pptx files."
+                if HOSTED
+                else "No PowerPoint files found. Choose files, or paste a path to a deck or folder."
+            ),
         ), 400
 
-    job = Job(id=uuid.uuid4().hex[:12], outroot=outroot, decks=decks, upload_dir=upload_dir)
+    job = Job(id=job_id, outroot=outroot, decks=decks, upload_dir=upload_dir)
     with LOCK:
         JOBS[job.id] = job
     threading.Thread(target=run_job, args=(job,), daemon=True).start()
@@ -186,7 +269,7 @@ def download_all(job_id: str):
     if not produced:
         abort(404)
 
-    bundle = os.path.join(tempfile.gettempdir(), f"pptx-splitter-{job_id}.zip")
+    bundle = bundle_path(job_id)
     with zipfile.ZipFile(bundle, "w", zipfile.ZIP_DEFLATED) as archive:
         for path in produced:
             # Keep each deck's folder, so pieces stay grouped inside the zip.
@@ -196,8 +279,13 @@ def download_all(job_id: str):
 
 if __name__ == "__main__":
     os.makedirs(DEFAULT_OUTPUT, exist_ok=True)
+    port = int(os.environ.get("PORT", "5000"))
     print("\n  PPTX → PDF converter")
-    print("  open http://127.0.0.1:5000")
+    print(f"  open http://127.0.0.1:{port}")
     print(f"  output folder: {DEFAULT_OUTPUT}\n")
-    # Local tool, single user: the reloader would restart mid-conversion.
-    app.run(host="127.0.0.1", port=5000, debug=False, use_reloader=False)
+    # The reloader would restart mid-conversion. A server must listen on every
+    # interface to be reachable; locally, only this machine should reach it.
+    app.run(
+        host="0.0.0.0" if HOSTED else "127.0.0.1",
+        port=port, debug=False, use_reloader=False,
+    )

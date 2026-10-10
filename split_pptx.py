@@ -47,6 +47,15 @@ from dataclasses import dataclass, field
 
 VIDEO_EXTENSIONS = {".mp4", ".m4v", ".mov", ".avi", ".wmv", ".mpeg", ".mpg", ".webm"}
 
+# An animated GIF is inserted as a picture, not a video, so PowerPoint's PDF
+# export freezes it on its first frame. One that is the slide's main content is
+# treated as a video. The area threshold keeps small animated icons and
+# decorations in the PDF instead of splitting the deck at them.
+GIF_MIN_SLIDE_FRACTION = 0.15
+# A GIF loops forever on a slide but an MP4 plays once, so a short loop is
+# repeated (whole loops only) until the clip lasts at least this long.
+GIF_MIN_SECONDS = 10.0
+
 # Mirrors the uploader's own content-name rule, so a generated name is never
 # rejected at upload time: 30 chars, no characters illegal in a filename, and
 # no trailing period or space.
@@ -100,7 +109,7 @@ class Slide:
     part: str                        # ppt/slides/slideN.xml
     title: str = ""
     notes: str = ""
-    video_part: str | None = None    # ppt/media/mediaN.mp4 when this slide holds a video
+    video_part: str | None = None    # ppt/media/mediaN.mp4 (or an animated .gif) when this slide holds a video
 
     @property
     def has_video(self) -> bool:
@@ -145,6 +154,12 @@ def read_deck(path: str) -> list[Slide]:
         if not ordered:
             raise DeckError("No slides found in the presentation.")
 
+        size = re.search(r"<p:sldSz\b[^>]*>", pres)
+        slide_area = (
+            int(xml_attr(size.group(0), "cx") or 0) * int(xml_attr(size.group(0), "cy") or 0)
+            if size else 0
+        ) or 12192000 * 6858000  # 16:9 default
+
         slides: list[Slide] = []
         for position, part in enumerate(ordered, start=1):
             slide = Slide(index=position, part=part)
@@ -164,6 +179,7 @@ def read_deck(path: str) -> list[Slide]:
             rel_part = posixpath.join(
                 posixpath.dirname(part), "_rels", posixpath.basename(part) + ".rels"
             )
+            gif_rels: dict[str, str] = {}
             if rel_part in names:
                 rel_body = text(rel_part)
                 for rel in re.findall(r"<Relationship\b[^>]*/?>", rel_body, re.I):
@@ -179,8 +195,127 @@ def read_deck(path: str) -> list[Slide]:
                         slide.video_part = resolved
                     if typ.lower().endswith("/notesslide") and resolved in names:
                         slide.notes = extract_notes(text(resolved))
+                    rid = xml_attr(rel, "Id")
+                    if (
+                        rid
+                        and typ.lower().endswith("/image")
+                        and tgt.lower().endswith(".gif")
+                        and resolved in names
+                    ):
+                        gif_rels[rid] = resolved
+            # A real video always wins over a GIF on the same slide.
+            if gif_rels and not slide.has_video:
+                slide.video_part = main_animated_gif(body, gif_rels, slide_area, z.read)
             slides.append(slide)
         return slides
+
+
+def main_animated_gif(slide_xml, gif_rels, slide_area, read) -> str | None:
+    """The largest animated GIF picture on the slide, if it is big enough to be
+    the slide's content rather than decoration."""
+    best, best_area = None, 0
+    for pic in re.findall(r"<p:pic>.*?</p:pic>", slide_xml, re.S):
+        embed = re.search(r'r:embed\s*=\s*["\']([^"\']+)["\']', pic)
+        extent = re.search(r'<a:ext\s+cx\s*=\s*["\'](\d+)["\']\s+cy\s*=\s*["\'](\d+)["\']', pic)
+        if not embed or not extent or embed.group(1) not in gif_rels:
+            continue
+        area = int(extent.group(1)) * int(extent.group(2))
+        if area > best_area and area >= GIF_MIN_SLIDE_FRACTION * slide_area:
+            part = gif_rels[embed.group(1)]
+            info = gif_info(read(part))
+            if info and info[2] > 1:
+                best, best_area = part, area
+    return best
+
+
+def gif_info(data: bytes) -> tuple[int, int, int, float] | None:
+    """(width, height, frames, seconds per loop) by walking the GIF's blocks."""
+    if len(data) < 13 or data[:6] not in (b"GIF87a", b"GIF89a"):
+        return None
+    width = int.from_bytes(data[6:8], "little")
+    height = int.from_bytes(data[8:10], "little")
+    pos = 13
+    if data[10] & 0x80:
+        pos += 3 << ((data[10] & 7) + 1)          # global colour table
+
+    def skip_sub_blocks(at: int) -> int:
+        while at < len(data) and data[at]:
+            at += data[at] + 1
+        return at + 1
+
+    frames, seconds, delay = 0, 0.0, 0
+    try:
+        while pos < len(data):
+            block = data[pos]
+            if block == 0x3B:                         # trailer
+                break
+            if block == 0x21:                         # extension
+                if data[pos + 1] == 0xF9:             # graphic control: frame delay
+                    delay = int.from_bytes(data[pos + 4:pos + 6], "little")
+                pos = skip_sub_blocks(pos + 2)
+            elif block == 0x2C:                       # image descriptor
+                flags = data[pos + 9]
+                pos += 10
+                if flags & 0x80:
+                    pos += 3 << ((flags & 7) + 1)     # local colour table
+                pos = skip_sub_blocks(pos + 1)        # LZW min code size, then data
+                frames += 1
+                # Browsers and PowerPoint play a 0-1 centisecond delay at 0.1s.
+                seconds += (delay if delay > 1 else 10) / 100
+                delay = 0
+            else:
+                break
+    except IndexError:
+        pass
+    return width, height, frames, seconds
+
+
+def find_ffmpeg() -> str | None:
+    """ffmpeg on PATH, or in Homebrew's usual places.
+
+    Apps launched from Finder (IDLE, for one) get a minimal PATH without
+    Homebrew, so the PATH lookup alone misses an installed ffmpeg.
+    """
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    for candidate in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"):
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def gif_to_mp4(data: bytes, target: str) -> bool:
+    """Render an animated GIF as an MP4 on white, looped to a watchable length.
+
+    Returns False when ffmpeg is not available, so the caller can keep the GIF.
+    """
+    ffmpeg = find_ffmpeg()
+    info = gif_info(data)
+    if not ffmpeg or not info:
+        return False
+    width, height, _, loop_seconds = info
+    loops = max(1, -(-GIF_MIN_SECONDS // max(loop_seconds, 0.01)))   # ceil
+    with tempfile.TemporaryDirectory() as tmp:
+        source = os.path.join(tmp, "in.gif")
+        with open(source, "wb") as handle:
+            handle.write(data)
+        subprocess.run(
+            [
+                ffmpeg, "-y", "-loglevel", "error",
+                "-ignore_loop", "0", "-i", source,
+                "-f", "lavfi", "-i", f"color=white:s={width}x{height}",
+                # Transparent pixels would otherwise turn black; H.264 also
+                # needs even dimensions.
+                "-filter_complex",
+                "[1:v][0:v]overlay=shortest=1,scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
+                "-t", f"{loops * loop_seconds:.3f}",
+                "-c:v", "libx264", "-movflags", "+faststart", "-an",
+                target,
+            ],
+            check=True, capture_output=True, text=True, timeout=600,
+        )
+    return os.path.exists(target) and os.path.getsize(target) > 0
 
 
 def extract_title(slide_xml: str) -> str:
@@ -292,10 +427,16 @@ def convert_to_pdf(source: str, destination: str) -> str:
     soffice = shutil.which("soffice") or shutil.which("libreoffice")
     if soffice:
         outdir = os.path.dirname(destination)
-        subprocess.run(
-            [soffice, "--headless", "--convert-to", "pdf", "--outdir", outdir, source],
-            check=True, capture_output=True, text=True, timeout=1800,
-        )
+        # A private profile per run: two LibreOffice runs sharing the default
+        # profile collide, and on a server the default may not be writable.
+        with tempfile.TemporaryDirectory(prefix="lo-profile-") as profile:
+            subprocess.run(
+                [
+                    soffice, f"-env:UserInstallation=file://{profile}",
+                    "--headless", "--convert-to", "pdf", "--outdir", outdir, source,
+                ],
+                check=True, capture_output=True, text=True, timeout=1800,
+            )
         produced = os.path.join(outdir, os.path.splitext(os.path.basename(source))[0] + ".pdf")
         if produced != destination and os.path.exists(produced):
             shutil.move(produced, destination)
@@ -321,6 +462,16 @@ def write_outputs(source: str, pdf_path: str, pieces: list[Piece], outdir: str) 
 
             if piece.kind == "video":
                 suffix = os.path.splitext(piece.video_part)[1].lower()
+                if suffix == ".gif":
+                    target = os.path.join(outdir, stem + ".mp4")
+                    try:
+                        converted = gif_to_mp4(z.read(piece.video_part), target)
+                    except subprocess.SubprocessError:
+                        converted = False
+                    if converted:
+                        written.append(target)
+                        continue
+                    # No ffmpeg (or it failed): hand over the GIF itself.
                 target = os.path.join(outdir, stem + suffix)
                 with z.open(piece.video_part) as src, open(target, "wb") as dst:
                     shutil.copyfileobj(src, dst)

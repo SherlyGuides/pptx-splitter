@@ -31,6 +31,7 @@
       </label>
       <ul class="chosen" id="chosen"></ul>
 
+      {% if not hosted %}
       <details>
         <summary>Local paths &amp; output folder</summary>
 
@@ -47,6 +48,7 @@
           <input type="text" name="outdir" id="outdir" value="{{ default_output }}">
         </div>
       </details>
+      {% endif %}
     </div>
 
     <button type="submit" class="btn block" id="go">Convert</button>
@@ -58,7 +60,11 @@
       <li>Files are named <code>Content piece N - Title</code> in reading order, ready to upload.</li>
       <li>Teacher notes are kept and renumbered to each PDF's own pages.</li>
       <li>Decks with hidden slides are refused — hidden slides would shift every later page.</li>
+      {% if hosted %}
+      <li>Results are deleted from the server a few hours after conversion — download them when it finishes.</li>
+      {% else %}
       <li>Uses Microsoft PowerPoint when installed, otherwise LibreOffice.</li>
+      {% endif %}
     </ul>
   </section>
 </main>
